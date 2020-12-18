@@ -1,0 +1,10 @@
+server:
+  port: 8090
+spring:
+  application:  
+    name: mock-thirdparty #供应商交互  
+  redis:
+    host: 192.168.200.129
+    password: root123
+notify-url: http://127.0.0.1:99/order/notify
+openProxy: 0

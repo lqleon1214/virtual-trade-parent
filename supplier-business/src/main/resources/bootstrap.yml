@@ -1,0 +1,24 @@
+spring:
+  application:
+    name: supplier-business #供应商交互
+  cloud:
+    consul:
+      host: 192.168.200.129
+      port: 8500
+      discovery:
+         enabled: true #开启服务发现,默认为true
+         service-name: ${spring.application.name} #注册服务名称
+         prefer-ip-address: true
+         register: true #进行服务注册,默认为true
+         deregister: true
+         register-health-check: true #开启健康检查,默认true
+         health-check-interval: 10s
+         health-check-critical-timeout: 2m #2分钟之后健康检查未通过取消注册
+         heartbeat:
+           enabled: true
+      config:
+         enabled: true
+         format: yaml         
+         prefix: config
+         defaultContext: supplier
+         data-key: data

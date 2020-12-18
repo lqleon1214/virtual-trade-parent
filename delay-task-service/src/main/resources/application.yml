@@ -1,0 +1,14 @@
+server:
+  port: 81
+spring:
+  application:  
+    name: delay-task-service #服务名
+  datasource:
+    url: jdbc:mysql://192.168.200.129:3306/delay_task?serverTimezone=Asia/Shanghai
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: root
+    password: root123
+  redis:
+    host: 192.168.200.129
+    password: root123
+    port: 6379

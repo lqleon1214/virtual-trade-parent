@@ -1,0 +1,14 @@
+server:
+  port: 99
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://192.168.200.129:3306/order_trade
+    password: root123
+    username: root
+  redis:
+    host: 192.168.200.129
+    password: root123
+    port: 6379
+  rabbitmq:
+    host: 192.168.200.129

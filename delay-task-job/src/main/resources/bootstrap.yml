@@ -1,0 +1,16 @@
+spring:
+  application:  
+    name: delay-task-job #指定服务名
+  cloud:
+    consul:
+      host: 192.168.200.129
+      port: 8500
+      discovery:
+        register: false #不需要注册到consul,只需要去发现服务即可
+        enabled: true #开启服务发现
+      config:
+        enabled: true #开启配置中心,默认true
+        format: yaml #配置格式yaml
+        prefix: config #配置数据的基本目录,默认config
+        default-context: delay-task #应用读取配置的目录,可据此区分不同应用的配置
+        data-key: data #consul中K/V的key,默认data
