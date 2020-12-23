@@ -14,19 +14,23 @@ import com.itheima.delaytask.mapper.TaskInfoLogsMapper;
 import com.itheima.delaytask.mapper.TaskInfoMapper;
 import com.itheima.delaytask.po.TaskInfo;
 import com.itheima.delaytask.po.TaskInfoLogs;
+import com.itheima.delaytask.properties.SystemParamProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import javax.annotation.PostConstruct;
-import java.util.Date;
-import java.util.List;
-import java.util.Objects;
-import java.util.Set;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Component
@@ -38,9 +42,27 @@ public class TaskServiceImpl implements TaskService {
     private TaskInfoLogsMapper taskInfoLogsMapper;
     @Autowired
     private CacheService cacheService;
+    @Autowired
+    private ThreadPoolTaskExecutor taskExecutor;
+    @Autowired
+    private SystemParamProperties paramProperties;
+    private long nextScheduleTime;                  // 下一次未来2分钟的时间节点
+    @Autowired
+    private ThreadPoolTaskScheduler threadPoolTaskScheduler;
 
     @PostConstruct
     public void syncData() {
+        // 首次运行即执行一次，然后按照设定的时间周期按照固定频率执行
+        threadPoolTaskScheduler.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                reloadData();
+            }
+        }, TimeUnit.MINUTES.toMillis(paramProperties.getPreLoad()));        // 需要传递一个毫秒值
+    }
+
+    private void reloadData() {
+        long start = System.currentTimeMillis();            // 计时代码
         // 先清除缓存中的原有数据
         clearCache();
         // 查询任务表中的所有分组
@@ -51,19 +73,52 @@ public class TaskServiceImpl implements TaskService {
         List<TaskInfo> group_tasks = taskInfoMapper.selectList(queryWrapper);
         // 获取每个分组下的任务数据将其添加到缓存
         if (Objects.isNull(group_tasks)) return;
+        CountDownLatch countDownLatch = new CountDownLatch(group_tasks.size());//计时代码
+        // 定义未来2分钟的时间节点变量
+        Calendar calendar = Calendar.getInstance();
+        calendar.add(Calendar.MINUTE, paramProperties.getPreLoad());
+        nextScheduleTime = calendar.getTimeInMillis();
         for (TaskInfo group_task : group_tasks) {
             // 查询该分组下的任务
-            queryWrapper.lambda()
-                    .eq(TaskInfo::getTaskType, group_task.getTaskType())
-                    .eq(TaskInfo::getPriority, group_task.getPriority());
-            List<TaskInfo> taskInfos = taskInfoMapper.selectList(queryWrapper);
-            // 调用addTaskToCache(Task)方法添加到缓存
-            for (TaskInfo taskInfo : taskInfos) {
-                Task task = new Task();
-                BeanUtils.copyProperties(taskInfo, task);
-                task.setExecuteTime(taskInfo.getExecuteTime().getTime());
-                addTaskToCache(task);
-            }
+//            queryWrapper.lambda()
+//                    .eq(TaskInfo::getTaskType, group_task.getTaskType())
+//                    .eq(TaskInfo::getPriority, group_task.getPriority());
+//            List<TaskInfo> taskInfos = taskInfoMapper.selectList(queryWrapper);
+//            // 调用addTaskToCache(Task)方法添加到缓存
+//            for (TaskInfo taskInfo : taskInfos) {
+//                Task task = new Task();
+//                BeanUtils.copyProperties(taskInfo, task);
+//                task.setExecuteTime(taskInfo.getExecuteTime().getTime());
+//                addTaskToCache(task);
+//            }
+            // 将每个分组都提交到线程池中执行
+            taskExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    // 查询该分组下的任务
+                    QueryWrapper<TaskInfo> queryWrapper = new QueryWrapper<>();
+                    queryWrapper.lambda()
+                            .eq(TaskInfo::getTaskType, group_task.getTaskType())
+                            .eq(TaskInfo::getPriority, group_task.getPriority());
+                    List<TaskInfo> taskInfos = taskInfoMapper.selectList(queryWrapper);
+                    // 调用addTaskToCache(Task)方法添加到缓存
+                    for (TaskInfo taskInfo : taskInfos) {
+                        Task task = new Task();
+                        BeanUtils.copyProperties(taskInfo, task);
+                        task.setExecuteTime(taskInfo.getExecuteTime().getTime());
+                        addTaskToCache(task);
+                    }
+                    countDownLatch.countDown();         // 计时代码
+                }
+            });
+        }
+
+        // 计时代码
+        try {
+            countDownLatch.await(5, TimeUnit.MINUTES);
+            log.info("多线程分组数据恢复耗时:{}", System.currentTimeMillis() - start);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
         }
     }
 
@@ -98,7 +153,7 @@ public class TaskServiceImpl implements TaskService {
             // 任务进入消费者队列List——数据从左侧入队列，消费时从右侧出队列——保证任务消费的顺序性
             // 同时我们让所有分组的key都有一个相同的前缀，方便进行管理
             cacheService.lLeftPush(DelayTaskRedisKeyConstants.TOPIC + key, JSON.toJSONString(task));
-        } else {
+        } else if (task.getExecuteTime() <= nextScheduleTime) {
             // 任务进行zset排序等待
             cacheService.zAdd(DelayTaskRedisKeyConstants.FUTURE + key, JSON.toJSONString(task), task.getExecuteTime());
         }
@@ -235,20 +290,32 @@ public class TaskServiceImpl implements TaskService {
 
     @Scheduled(cron = "*/1 * * * * ?")
     public void refresh() {
-        // 找到未来数据集合的所有key
-        Set<String> future_keys = cacheService.scan(DelayTaskRedisKeyConstants.FUTURE + "*");
-        if (future_keys == null || future_keys.size() == 0) return;
-        for (String future_key : future_keys) {
-            // 根据每一个key从该分组下 获取当前需要执行的任务数据Set集合
-            Set<String> values = cacheService.zRangeByScore(future_key, 0, System.currentTimeMillis());
-            if (values == null || values.size() == 0) continue;
-            // 将这组数据添加到消费者队列的对应分组上，并从zset中移除
-            String topicKey = DelayTaskRedisKeyConstants.TOPIC + future_key.split(DelayTaskRedisKeyConstants.FUTURE)[1];
+        // 如果这个地方不放入线程池，如果这个地方的执行超过1s，就会造成下一个任务延迟执行
+        taskExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                log.info("{}进行了定时判断", LocalDateTime.now().format(DateTimeFormatter.ISO_DATE_TIME));
+                try {
+                    TimeUnit.SECONDS.sleep(2);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                // 找到未来数据集合的所有key
+                Set<String> future_keys = cacheService.scan(DelayTaskRedisKeyConstants.FUTURE + "*");
+                if (future_keys == null || future_keys.size() == 0) return;
+                for (String future_key : future_keys) {
+                    // 根据每一个key从该分组下 获取当前需要执行的任务数据Set集合
+                    Set<String> values = cacheService.zRangeByScore(future_key, 0, System.currentTimeMillis());
+                    if (values == null || values.size() == 0) continue;
+                    // 将这组数据添加到消费者队列的对应分组上，并从zset中移除
+                    String topicKey = DelayTaskRedisKeyConstants.TOPIC + future_key.split(DelayTaskRedisKeyConstants.FUTURE)[1];
 //            for (String value : values) {
 //                cacheService.lLeftPush(topicKey, value);
 //                cacheService.zRemove(future_key, value);
 //            }
-            cacheService.refreshWithPipeline(future_key, topicKey, values);         // 只需此依据，改造完成
-        }
+                    cacheService.refreshWithPipeline(future_key, topicKey, values);         // 只需此依据，改造完成
+                }
+            }
+        });
     }
 }
