@@ -1422,18 +1422,22 @@ public class CacheService extends CachingConfigurerSupport {
         return results;
     }
 
-   /* public List<Object> refreshWithPipeline(String future_key,String topic_key, Collection<String> values){
+    public List<Object> refreshWithPipeline(String future_key,String topic_key, Collection<String> values){
         List<Object> results =  stringRedisTemplate.executePipelined(new RedisCallback<Object>() {
             @Override
             public Object doInRedis(RedisConnection connection) throws DataAccessException {
+                //拿到连接StringRediesConnection,stringRedisTemplate和RedisTemplate所使用的 Connection不一样，各自互不影响
                 StringRedisConnection stringRedisConn = (StringRedisConnection)connection;
                 String[] strvalues= values.toArray(new String[values.size()]);
+                //将任务数据添加到消费者队列
                 stringRedisConn.lPush(topic_key,strvalues);
+                //将任务数据从未来数据集合中移除
                 stringRedisConn.zRem(future_key,strvalues);
+                //因为此次操作没有数据需要返回所以return null
                 return null;
             }
         });
         return results;
-    }*/
+    }
 
 }

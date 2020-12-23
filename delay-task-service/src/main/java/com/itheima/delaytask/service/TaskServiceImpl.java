@@ -1,6 +1,7 @@
 package com.itheima.delaytask.service;
 
 import com.alibaba.fastjson.JSON;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.itheima.cache.CacheService;
 import com.itheima.delaytask.constants.DelayTaskRedisKeyConstants;
@@ -13,17 +14,22 @@ import com.itheima.delaytask.mapper.TaskInfoLogsMapper;
 import com.itheima.delaytask.mapper.TaskInfoMapper;
 import com.itheima.delaytask.po.TaskInfo;
 import com.itheima.delaytask.po.TaskInfoLogs;
-import jdk.internal.org.jline.terminal.spi.JansiSupport;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+import javax.annotation.PostConstruct;
 import java.util.Date;
+import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 
 @Slf4j
+@Component
 public class TaskServiceImpl implements TaskService {
 
     @Autowired
@@ -32,6 +38,43 @@ public class TaskServiceImpl implements TaskService {
     private TaskInfoLogsMapper taskInfoLogsMapper;
     @Autowired
     private CacheService cacheService;
+
+    @PostConstruct
+    public void syncData() {
+        // 先清除缓存中的原有数据
+        clearCache();
+        // 查询任务表中的所有分组
+        QueryWrapper<TaskInfo> queryWrapper = new QueryWrapper<>();
+        queryWrapper.lambda()
+                .select(TaskInfo::getTaskType, TaskInfo::getPriority)
+                .groupBy(TaskInfo::getTaskType, TaskInfo::getPriority);
+        List<TaskInfo> group_tasks = taskInfoMapper.selectList(queryWrapper);
+        // 获取每个分组下的任务数据将其添加到缓存
+        if (Objects.isNull(group_tasks)) return;
+        for (TaskInfo group_task : group_tasks) {
+            // 查询该分组下的任务
+            queryWrapper.lambda()
+                    .eq(TaskInfo::getTaskType, group_task.getTaskType())
+                    .eq(TaskInfo::getPriority, group_task.getPriority());
+            List<TaskInfo> taskInfos = taskInfoMapper.selectList(queryWrapper);
+            // 调用addTaskToCache(Task)方法添加到缓存
+            for (TaskInfo taskInfo : taskInfos) {
+                Task task = new Task();
+                BeanUtils.copyProperties(taskInfo, task);
+                task.setExecuteTime(taskInfo.getExecuteTime().getTime());
+                addTaskToCache(task);
+            }
+        }
+    }
+
+    private void clearCache() {
+        // 缓存中要清楚的消费者队列和外来数据集合————我们只需找到所有跟延迟任务相关的key，然后删除这些key即可
+        Set<String> futureKeys = cacheService.scan(DelayTaskRedisKeyConstants.FUTURE + "*");
+        Set<String> topicKeys = cacheService.scan(DelayTaskRedisKeyConstants.TOPIC + "*");
+        // 删除这些key即可
+        cacheService.delete(futureKeys);
+        cacheService.delete(topicKeys);
+    }
 
     @Override
     @Transactional
@@ -188,5 +231,24 @@ public class TaskServiceImpl implements TaskService {
             throw new ScheduleSystemException(e);
         }
         return null;
+    }
+
+    @Scheduled(cron = "*/1 * * * * ?")
+    public void refresh() {
+        // 找到未来数据集合的所有key
+        Set<String> future_keys = cacheService.scan(DelayTaskRedisKeyConstants.FUTURE + "*");
+        if (future_keys == null || future_keys.size() == 0) return;
+        for (String future_key : future_keys) {
+            // 根据每一个key从该分组下 获取当前需要执行的任务数据Set集合
+            Set<String> values = cacheService.zRangeByScore(future_key, 0, System.currentTimeMillis());
+            if (values == null || values.size() == 0) continue;
+            // 将这组数据添加到消费者队列的对应分组上，并从zset中移除
+            String topicKey = DelayTaskRedisKeyConstants.TOPIC + future_key.split(DelayTaskRedisKeyConstants.FUTURE)[1];
+//            for (String value : values) {
+//                cacheService.lLeftPush(topicKey, value);
+//                cacheService.zRemove(future_key, value);
+//            }
+            cacheService.refreshWithPipeline(future_key, topicKey, values);         // 只需此依据，改造完成
+        }
     }
 }
